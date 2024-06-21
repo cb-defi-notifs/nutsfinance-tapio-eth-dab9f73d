@@ -4,6 +4,7 @@ import "@nomiclabs/hardhat-web3";
 import "@nomicfoundation/hardhat-toolbox";
 import "@primitivefi/hardhat-dodoc";
 import "solidity-coverage";
+import "hardhat-contract-sizer";
 
 import * as dotenv from "dotenv";
 
@@ -17,12 +18,6 @@ const config: HardhatUserConfig = {
       optimizer: {
         enabled: true,
         runs: 1000,
-        details: {
-          yul: true,
-          yulDetails: {
-            optimizerSteps: "u",
-          },
-        },
       },
     },
   },
@@ -39,16 +34,17 @@ const config: HardhatUserConfig = {
     apiKey: "ZVS7QS6TGF6VNAEA267A9KP2KRCDSNRP1G",
   },
   dodoc: {
-    outputDir: "./docs",
+    outputDir: "./docs/contracts",
     include: [
       "contracts/governance",
       "contracts/interfaces",
       "contracts/misc",
       "contracts/reth",
       "contracts/StableAsset.sol",
+      "contracts/TapETH.sol",
+      "contracts/WTapETH.sol",
       "contracts/StableAssetApplication.sol",
-      "contracts/StableAssetToken.sol"
-    ]
+    ],
   },
 };
 

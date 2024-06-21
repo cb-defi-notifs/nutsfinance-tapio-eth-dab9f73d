@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.9;
+pragma solidity ^0.8.18;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+
+import "./GaugeRewardController.sol";
 
 /**
  * @title GaugeController
@@ -15,6 +17,10 @@ import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.
 contract GaugeController is Initializable, ReentrancyGuardUpgradeable {
   using SafeERC20Upgradeable for IERC20Upgradeable;
   uint256 public constant WEEK = 604800;
+  /**
+   * @dev Controller for reward weight calculation.
+   */
+  IGaugeRewardController public rewardController;
 
   /**
    * @dev This is the account that has governance control over the GaugeController contract.
@@ -32,39 +38,14 @@ contract GaugeController is Initializable, ReentrancyGuardUpgradeable {
   address public poolToken;
 
   /**
-   * @dev This is a mapping of index and pool address.
-   */
-  mapping(uint256 => address) public poolIndexToAddress;
-
-  /**
-   * @dev This is a mapping of index and pool address.
-   */
-  mapping(address => uint256) public poolAddressToIndex;
-
-  /**
    * @dev This is a mapping of index and total reward claimable.
    */
-  mapping(uint256 => uint256) public claimable;
+  mapping(address => uint256) public claimable;
 
   /**
    * @dev This is a mapping of index and reward claimed.
    */
-  mapping(uint256 => uint256) public claimed;
-
-  /**
-   * @dev This is a mapping of index and pool activated.
-   */
-  mapping(uint256 => bool) public poolActivated;
-
-  /**
-   * @dev This is a mapping of index and pool weight.
-   */
-  mapping(uint256 => uint256) public poolWeight;
-
-  /**
-   * @dev This is the total count of pool.
-   */
-  uint256 public poolSize;
+  mapping(address => uint256) public claimed;
 
   /**
    * @dev This is reward rate per week.
@@ -77,10 +58,21 @@ contract GaugeController is Initializable, ReentrancyGuardUpgradeable {
   uint256 public lastCheckpoint;
 
   /**
+   * @dev Pending governance address,
+   */
+  address public pendingGovernance;
+
+  /**
    * @dev This event is emitted when the governance is modified.
    * @param governance is the new value of the governance.
    */
   event GovernanceModified(address governance);
+
+  /**
+   * @dev This event is emitted when the governance is modified.
+   * @param governance is the new value of the governance.
+   */
+  event GovernanceProposed(address governance);
 
   /**
    * @dev This event is emitted when the rewardRatePerWeek is modified.
@@ -89,59 +81,19 @@ contract GaugeController is Initializable, ReentrancyGuardUpgradeable {
   event RewardRateModified(uint256 rewardRatePerWeek);
 
   /**
-   * @dev This event is emitted when a new pool is added.
-   * @param poolIndex is the new pool index.
-   * @param poolAddress is the new pool address.
-   */
-  event PoolAdded(uint256 indexed poolIndex, address indexed poolAddress);
-
-  /**
-   * @dev This event is emitted when a pool is enabled.
-   * @param poolIndex is the pool index.
-   * @param poolAddress is the pool address.
-   */
-  event PoolEnabled(uint256 indexed poolIndex, address indexed poolAddress);
-
-  /**
-   * @dev This event is emitted when a pool is disabled.
-   * @param poolIndex is the pool index.
-   * @param poolAddress is the pool address.
-   */
-  event PoolDisabled(uint256 indexed poolIndex, address indexed poolAddress);
-
-  /**
-   * @dev This event is emitted when a pool weight is updated.
-   * @param poolIndex is the pool index.
-   * @param poolAddress is the pool address.
-   * @param weight is the pool weight.
-   */
-  event PoolWeightUpdated(
-    uint256 indexed poolIndex,
-    address indexed poolAddress,
-    uint256 weight
-  );
-
-  /**
    * @dev This event is emitted when a reward is claimed.
-   * @param poolIndex is the pool index.
    * @param poolAddress is the pool address.
    * @param amount is the amount claimed.
    */
-  event Claimed(
-    uint256 indexed poolIndex,
-    address indexed poolAddress,
-    uint256 amount
-  );
+  event Claimed(address indexed poolAddress, uint256 amount);
 
   /**
    * @dev This event is emitted when a reward is checkpointed.
-   * @param poolIndex is the pool index.
    * @param poolAddress is the pool address.
    * @param totalAmount is the amount claimed.
    * @param timestamp is timestamp of checkpoint.
    */
   event Checkpointed(
-    uint256 indexed poolIndex,
     address indexed poolAddress,
     uint256 totalAmount,
     uint256 timestamp
@@ -155,7 +107,8 @@ contract GaugeController is Initializable, ReentrancyGuardUpgradeable {
   function initialize(
     address _rewardToken,
     address _poolToken,
-    uint256 _rewardRatePerWeek
+    uint256 _rewardRatePerWeek,
+    IGaugeRewardController _rewardController
   ) public initializer {
     require(_rewardToken != address(0x0), "reward token not set");
     require(_poolToken != address(0x0), "pool token not set");
@@ -166,18 +119,28 @@ contract GaugeController is Initializable, ReentrancyGuardUpgradeable {
     rewardToken = _rewardToken;
     poolToken = _poolToken;
     rewardRatePerWeek = _rewardRatePerWeek;
+    rewardController = _rewardController;
     lastCheckpoint = block.timestamp;
   }
 
   /**
-   * @dev Updates the govenance address.
-   * @param _governance The new governance address.
+   * @dev Propose the govenance address.
+   * @param _governance Address of the new governance.
    */
-  function setGovernance(address _governance) external {
+  function proposeGovernance(address _governance) public {
     require(msg.sender == governance, "not governance");
-    require(_governance != address(0x0), "governance not set");
-    governance = _governance;
-    emit GovernanceModified(_governance);
+    pendingGovernance = _governance;
+    emit GovernanceProposed(_governance);
+  }
+
+  /**
+   * @dev Accept the govenance address.
+   */
+  function acceptGovernance() public {
+    require(msg.sender == pendingGovernance, "not pending governance");
+    governance = pendingGovernance;
+    pendingGovernance = address(0);
+    emit GovernanceModified(governance);
   }
 
   /**
@@ -192,60 +155,6 @@ contract GaugeController is Initializable, ReentrancyGuardUpgradeable {
   }
 
   /**
-   * @dev Add a new pool.
-   * @param _poolAddress The pool address to add.
-   */
-  function addPool(address _poolAddress) external {
-    require(msg.sender == governance, "not governance");
-    require(_poolAddress != address(0x0), "pool address not set");
-
-    uint256 newPoolIndex = poolSize++;
-    poolIndexToAddress[newPoolIndex] = _poolAddress;
-    poolAddressToIndex[_poolAddress] = newPoolIndex;
-    poolActivated[newPoolIndex] = true;
-    poolWeight[newPoolIndex] = 0;
-    emit PoolAdded(newPoolIndex, _poolAddress);
-    emit PoolEnabled(newPoolIndex, _poolAddress);
-  }
-
-  /**
-   * @dev Enable a pool.
-   * @param _poolIndex The pool index to enable.
-   */
-  function enablePool(uint256 _poolIndex) external {
-    require(msg.sender == governance, "not governance");
-    address _poolAddress = poolIndexToAddress[_poolIndex];
-    require(_poolAddress != address(0x0), "pool address not set");
-    poolActivated[_poolIndex] = true;
-    emit PoolEnabled(_poolIndex, _poolAddress);
-  }
-
-  /**
-   * @dev Disable a pool.
-   * @param _poolIndex The pool index to disable.
-   */
-  function disablePool(uint256 _poolIndex) external {
-    require(msg.sender == governance, "not governance");
-    address _poolAddress = poolIndexToAddress[_poolIndex];
-    require(_poolAddress != address(0x0), "pool address not set");
-    poolActivated[_poolIndex] = false;
-    emit PoolDisabled(_poolIndex, _poolAddress);
-  }
-
-  /**
-   * @dev Disable a pool.
-   * @param _poolIndex The pool index to modify weight.
-   * @param weight The pool weight.
-   */
-  function updatePoolWeight(uint256 _poolIndex, uint256 weight) external {
-    require(msg.sender == governance, "not governance");
-    address _poolAddress = poolIndexToAddress[_poolIndex];
-    require(_poolAddress != address(0x0), "pool address not set");
-    poolWeight[_poolIndex] = weight;
-    emit PoolWeightUpdated(_poolIndex, _poolAddress, weight);
-  }
-
-  /**
    * @dev Calculate new reward.
    */
   function _checkpoint() internal {
@@ -253,24 +162,21 @@ contract GaugeController is Initializable, ReentrancyGuardUpgradeable {
     uint256 rewardAvailable = (rewardRatePerWeek *
       (currentTimestamp - lastCheckpoint)) / WEEK;
     uint256 total = 0;
+    uint128 poolSize = rewardController.nGauges();
     uint256[] memory rewardPoolsCalc = new uint256[](poolSize);
-    for (uint256 i = 0; i < poolSize; i++) {
-      uint256 result = getRewardForPool(i);
+    for (uint128 i = 0; i < poolSize; i++) {
+      uint256 result = getRewardForPoolWrite(i);
       total += result;
       rewardPoolsCalc[i] = result;
     }
-    for (uint256 i = 0; i < poolSize; i++) {
+    for (uint128 i = 0; i < poolSize; i++) {
+      address poolAddress = rewardController.getGauge(i);
       uint256 share = 0;
       if (total > 0) {
         share = (rewardPoolsCalc[i] * rewardAvailable) / total;
       }
-      claimable[i] += share;
-      emit Checkpointed(
-        i,
-        poolIndexToAddress[i],
-        claimable[i],
-        currentTimestamp
-      );
+      claimable[poolAddress] += share;
+      emit Checkpointed(poolAddress, claimable[poolAddress], currentTimestamp);
     }
 
     lastCheckpoint = currentTimestamp;
@@ -286,25 +192,61 @@ contract GaugeController is Initializable, ReentrancyGuardUpgradeable {
   /**
    * @dev Calculate new reward for a pool.
    */
-  function getRewardForPool(uint256 poolIndex) internal view returns (uint256) {
-    if (!poolActivated[poolIndex]) {
-      return 0;
-    }
+  function getRewardForPoolWrite(uint128 poolIndex) internal returns (uint256) {
+    address poolAddress = rewardController.getGauge(poolIndex);
     return
-      IERC20Upgradeable(poolToken).balanceOf(poolIndexToAddress[poolIndex]) *
-      poolWeight[poolIndex];
+      IERC20Upgradeable(poolToken).balanceOf(poolAddress) *
+      rewardController.gaugeRelativeWeightWrite(poolAddress);
+  }
+
+  /**
+   * @dev Calculate new reward for a pool.
+   */
+  function getRewardForPool(uint128 poolIndex) internal view returns (uint256) {
+    address poolAddress = rewardController.getGauge(poolIndex);
+    return
+      IERC20Upgradeable(poolToken).balanceOf(poolAddress) *
+      rewardController.gaugeRelativeWeight(poolAddress);
   }
 
   /**
    * @dev Claim reward.
    */
   function claim() external {
-    uint256 poolIndex = poolAddressToIndex[msg.sender];
-    require(msg.sender == poolIndexToAddress[poolIndex], "not registered");
+    address poolAddress = msg.sender;
     _checkpoint();
-    uint256 amount = claimable[poolIndex] - claimed[poolIndex];
+    uint256 amount = claimable[poolAddress] - claimed[poolAddress];
     IERC20Upgradeable(rewardToken).safeTransfer(msg.sender, amount);
-    claimed[poolIndex] += amount;
-    emit Claimed(poolIndex, msg.sender, amount);
+    claimed[poolAddress] += amount;
+    emit Claimed(poolAddress, amount);
+  }
+
+  /**
+   * @dev Get claimable reward.
+   */
+  function getClaimable() external view returns (uint256) {
+    address poolAddress = msg.sender;
+    uint256 currentTimestamp = block.timestamp;
+    uint256 rewardAvailable = (rewardRatePerWeek *
+      (currentTimestamp - lastCheckpoint)) / WEEK;
+    uint256 total = 0;
+    uint128 poolSize = rewardController.nGauges();
+    uint256[] memory rewardPoolsCalc = new uint256[](poolSize);
+    for (uint128 i = 0; i < poolSize; i++) {
+      uint256 result = getRewardForPool(i);
+      total += result;
+      rewardPoolsCalc[i] = result;
+    }
+    for (uint128 i = 0; i < poolSize; i++) {
+      address poolAddress = rewardController.getGauge(i);
+      uint256 share = 0;
+      if (total > 0) {
+        share = (rewardPoolsCalc[i] * rewardAvailable) / total;
+      }
+      if (poolAddress == msg.sender) {
+        return share;
+      }
+    }
+    return 0;
   }
 }

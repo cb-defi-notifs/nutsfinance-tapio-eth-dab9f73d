@@ -10,6 +10,17 @@ The StableSwap Application provides an interface for users to interact with Stab
 
 ## Methods
 
+### acceptGovernance
+
+```solidity
+function acceptGovernance() external nonpayable
+```
+
+
+
+*Accept the govenance address.*
+
+
 ### allowedPoolAddress
 
 ```solidity
@@ -35,7 +46,7 @@ function allowedPoolAddress(address) external view returns (bool)
 ### getSwapAmountCrossPool
 
 ```solidity
-function getSwapAmountCrossPool(contract StableAsset _sourceSwap, contract StableAsset _destSwap, address _sourceToken, address _destToken, uint256 _amount) external view returns (uint256)
+function getSwapAmountCrossPool(contract StableAsset _sourceSwap, contract StableAsset _destSwap, address _sourceToken, address _destToken, uint256 _amount) external view returns (uint256, uint256)
 ```
 
 
@@ -56,7 +67,8 @@ function getSwapAmountCrossPool(contract StableAsset _sourceSwap, contract Stabl
 
 | Name | Type | Description |
 |---|---|---|
-| _0 | uint256 | undefined |
+| _0 | uint256 | The Amount of dest token to get. |
+| _1 | uint256 | The amount of fee to charge. |
 
 ### governance
 
@@ -109,6 +121,78 @@ function mint(contract StableAsset _swap, uint256[] _amounts, uint256 _minMintAm
 | _amounts | uint256[] | Unconverted token balances used to mint pool token. |
 | _minMintAmount | uint256 | Minimum amount of pool token to mint. |
 
+### pendingGovernance
+
+```solidity
+function pendingGovernance() external view returns (address)
+```
+
+
+
+*Pending governance address,*
+
+
+#### Returns
+
+| Name | Type | Description |
+|---|---|---|
+| _0 | address | undefined |
+
+### pools
+
+```solidity
+function pools(uint256) external view returns (address)
+```
+
+
+
+
+
+#### Parameters
+
+| Name | Type | Description |
+|---|---|---|
+| _0 | uint256 | undefined |
+
+#### Returns
+
+| Name | Type | Description |
+|---|---|---|
+| _0 | address | undefined |
+
+### proposeGovernance
+
+```solidity
+function proposeGovernance(address _governance) external nonpayable
+```
+
+
+
+*Propose the govenance address.*
+
+#### Parameters
+
+| Name | Type | Description |
+|---|---|---|
+| _governance | address | Address of the new governance. |
+
+### rebase
+
+```solidity
+function rebase() external nonpayable returns (uint256 _amount)
+```
+
+This function allows to rebase TapETH by increasing his total supply from all stableSwap pools by the staking rewards and the swap fee.
+
+
+
+
+#### Returns
+
+| Name | Type | Description |
+|---|---|---|
+| _amount | uint256 | undefined |
+
 ### redeemProportion
 
 ```solidity
@@ -145,22 +229,6 @@ function redeemSingle(contract StableAsset _swap, uint256 _amount, uint256 _i, u
 | _amount | uint256 | Amount of pool token to redeem. |
 | _i | uint256 | Index of the token to redeem to. |
 | _minRedeemAmount | uint256 | Minimum amount of the underlying token to redeem to. |
-
-### setGovernance
-
-```solidity
-function setGovernance(address _governance) external nonpayable
-```
-
-
-
-*Updates the govenance address.*
-
-#### Parameters
-
-| Name | Type | Description |
-|---|---|---|
-| _governance | address | The new governance address. |
 
 ### swap
 
@@ -257,6 +325,22 @@ event GovernanceModified(address governance)
 |---|---|---|
 | governance  | address | is the new value of the governance. |
 
+### GovernanceProposed
+
+```solidity
+event GovernanceProposed(address governance)
+```
+
+
+
+*This event is emitted when the governance is modified.*
+
+#### Parameters
+
+| Name | Type | Description |
+|---|---|---|
+| governance  | address | is the new value of the governance. |
+
 ### Initialized
 
 ```solidity
@@ -290,5 +374,52 @@ event PoolModified(address swap, bool enabled)
 | swap  | address | is the new value of the swap. |
 | enabled  | bool | pool enabled or disabled. |
 
+
+
+## Errors
+
+### EthAmount
+
+```solidity
+error EthAmount(uint256 requiredAmount, uint256 sentAmount)
+```
+
+
+
+
+
+#### Parameters
+
+| Name | Type | Description |
+|---|---|---|
+| requiredAmount | uint256 | undefined |
+| sentAmount | uint256 | undefined |
+
+### FailedEtherTransfer
+
+```solidity
+error FailedEtherTransfer()
+```
+
+
+
+
+
+
+### NotAllowedPool
+
+```solidity
+error NotAllowedPool(address pool)
+```
+
+
+
+
+
+#### Parameters
+
+| Name | Type | Description |
+|---|---|---|
+| pool | address | undefined |
 
 

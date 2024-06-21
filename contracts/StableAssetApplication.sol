@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.9;
+pragma solidity ^0.8.18;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20BurnableUpgradeable.sol";
@@ -8,7 +8,12 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeab
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
 import "./interfaces/IWETH.sol";
+import "./interfaces/Ipool.sol";
 import "./StableAsset.sol";
+
+error NotAllowedPool(address pool);
+error EthAmount(uint256 requiredAmount, uint256 sentAmount);
+error FailedEtherTransfer();
 
 /**
  * @title StableAsset Application
@@ -36,6 +41,13 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
    */
   mapping(address => bool) public allowedPoolAddress;
 
+  address[] public pools;
+
+  /**
+   * @dev Pending governance address,
+   */
+  address public pendingGovernance;
+
   /**
    * @dev This event is emitted when the governance is modified.
    * @param governance is the new value of the governance.
@@ -48,6 +60,12 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
    * @param enabled pool enabled or disabled.
    */
   event PoolModified(address swap, bool enabled);
+
+  /**
+   * @dev This event is emitted when the governance is modified.
+   * @param governance is the new value of the governance.
+   */
+  event GovernanceProposed(address governance);
 
   /**
    * @dev Initializes the StableSwap Application contract.
@@ -79,10 +97,14 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
     uint256 _minMintAmount
   ) external payable nonReentrant {
     address[] memory tokens = _swap.getTokens();
-    address poolToken = _swap.poolToken();
+    address poolToken = address(_swap.poolToken());
     uint256 wETHIndex = findTokenIndex(tokens, address(wETH));
-    require(_amounts[wETHIndex] == msg.value, "msg.value equals amounts");
-    require(allowedPoolAddress[address(_swap)], "pool not allowed");
+    if (_amounts[wETHIndex] != msg.value) {
+      revert EthAmount(_amounts[wETHIndex], msg.value);
+    }
+    if (!allowedPoolAddress[address(_swap)]) {
+      revert NotAllowedPool(address(_swap));
+    }
 
     if (_amounts[wETHIndex] > 0) {
       wETH.deposit{value: _amounts[wETHIndex]}();
@@ -118,13 +140,20 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
   ) external payable nonReentrant {
     address[] memory tokens = _swap.getTokens();
     uint256 wETHIndex = findTokenIndex(tokens, address(wETH));
-    require(allowedPoolAddress[address(_swap)], "pool not allowed");
+    if (!allowedPoolAddress[address(_swap)]) {
+      revert NotAllowedPool(address(_swap));
+    }
 
     if (_i == wETHIndex) {
-      require(_dx == msg.value, "msg.value equals amounts");
+      if (_dx != msg.value) {
+        revert EthAmount(_dx, msg.value);
+      }
+
       wETH.deposit{value: _dx}();
     } else {
-      require(0 == msg.value, "msg.value equals 0");
+      if (msg.value != 0) {
+        revert EthAmount(0, msg.value);
+      }
       IERC20Upgradeable(tokens[_i]).safeTransferFrom(
         msg.sender,
         address(this),
@@ -137,7 +166,9 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
     if (_j == wETHIndex) {
       wETH.withdraw(swapAmount);
       (bool success, ) = msg.sender.call{value: swapAmount}("");
-      require(success, "Transfer failed.");
+      if (!success) {
+        revert FailedEtherTransfer();
+      }
     } else {
       IERC20Upgradeable(tokens[_j]).safeTransfer(msg.sender, swapAmount);
     }
@@ -155,10 +186,11 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
     uint256[] calldata _minRedeemAmounts
   ) external nonReentrant {
     address[] memory tokens = _swap.getTokens();
-    address poolToken = _swap.poolToken();
+    address poolToken = address(_swap.poolToken());
     uint256 wETHIndex = findTokenIndex(tokens, address(wETH));
-    require(allowedPoolAddress[address(_swap)], "pool not allowed");
-
+    if (!allowedPoolAddress[address(_swap)]) {
+      revert NotAllowedPool(address(_swap));
+    }
     IERC20Upgradeable(poolToken).safeApprove(address(_swap), _amount);
     IERC20Upgradeable(poolToken).safeTransferFrom(
       msg.sender,
@@ -175,7 +207,9 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
       if (i == wETHIndex) {
         wETH.withdraw(amounts[i]);
         (bool success, ) = msg.sender.call{value: amounts[i]}("");
-        require(success, "Transfer failed.");
+        if (!success) {
+          revert FailedEtherTransfer();
+        }
       } else {
         IERC20Upgradeable(tokens[i]).safeTransfer(msg.sender, amounts[i]);
       }
@@ -196,9 +230,11 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
     uint256 _minRedeemAmount
   ) external nonReentrant {
     address[] memory tokens = _swap.getTokens();
-    address poolToken = _swap.poolToken();
+    address poolToken = address(_swap.poolToken());
     uint256 wETHIndex = findTokenIndex(tokens, address(wETH));
-    require(allowedPoolAddress[address(_swap)], "pool not allowed");
+    if (!allowedPoolAddress[address(_swap)]) {
+      revert NotAllowedPool(address(_swap));
+    }
     IERC20Upgradeable(poolToken).safeApprove(address(_swap), _amount);
     IERC20Upgradeable(poolToken).safeTransferFrom(
       msg.sender,
@@ -211,7 +247,9 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
     if (_i == wETHIndex) {
       wETH.withdraw(redeemAmount);
       (bool success, ) = msg.sender.call{value: redeemAmount}("");
-      require(success, "Transfer failed.");
+      if (!success) {
+        revert FailedEtherTransfer();
+      }
     } else {
       IERC20Upgradeable(tokens[_i]).safeTransfer(msg.sender, redeemAmount);
     }
@@ -224,6 +262,8 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
    * @param _sourceToken source token.
    * @param _destToken dest token.
    * @param _amount Amount of source token to swap.
+   * @return The Amount of dest token to get.
+   * @return The amount of fee to charge.
    */
   function getSwapAmountCrossPool(
     StableAsset _sourceSwap,
@@ -231,21 +271,27 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
     address _sourceToken,
     address _destToken,
     uint256 _amount
-  ) public view returns (uint256) {
+  ) public view returns (uint256, uint256) {
     address[] memory sourceTokens = _sourceSwap.getTokens();
     address[] memory destTokens = _destSwap.getTokens();
-    require(allowedPoolAddress[address(_sourceSwap)], "pool not allowed");
-    require(allowedPoolAddress[address(_destSwap)], "pool not allowed");
+    if (!allowedPoolAddress[address(_sourceSwap)]) {
+      revert NotAllowedPool(address(_sourceSwap));
+    }
+    if (!allowedPoolAddress[address(_destSwap)]) {
+      revert NotAllowedPool(address(_destSwap));
+    }
     uint256 sourceIndex = findTokenIndex(sourceTokens, _sourceToken);
     uint256 destIndex = findTokenIndex(destTokens, _destToken);
     uint256[] memory _mintAmounts = new uint256[](sourceTokens.length);
     _mintAmounts[sourceIndex] = _amount;
-    (uint256 mintAmount, ) = _sourceSwap.getMintAmount(_mintAmounts);
-    (uint256 redeemAmount, ) = _destSwap.getRedeemSingleAmount(
+    (uint256 mintAmount, uint256 mintFee) = _sourceSwap.getMintAmount(
+      _mintAmounts
+    );
+    (uint256 redeemAmount, uint256 redeemFee) = _destSwap.getRedeemSingleAmount(
       mintAmount,
       destIndex
     );
-    return redeemAmount;
+    return (redeemAmount, mintFee + redeemFee);
   }
 
   /**
@@ -267,8 +313,14 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
   ) external nonReentrant {
     address[] memory sourceTokens = _sourceSwap.getTokens();
     address[] memory destTokens = _destSwap.getTokens();
-    require(allowedPoolAddress[address(_sourceSwap)], "pool not allowed");
-    require(allowedPoolAddress[address(_destSwap)], "pool not allowed");
+    if (!allowedPoolAddress[address(_sourceSwap)]) {
+      revert NotAllowedPool(address(_sourceSwap));
+    }
+
+    if (!allowedPoolAddress[address(_destSwap)]) {
+      revert NotAllowedPool(address(_destSwap));
+    }
+
     uint256 sourceIndex = findTokenIndex(sourceTokens, _sourceToken);
     uint256 destIndex = findTokenIndex(destTokens, _destToken);
 
@@ -282,7 +334,7 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
     uint256[] memory _mintAmounts = new uint256[](sourceTokens.length);
     _mintAmounts[sourceIndex] = _amount;
     uint256 mintAmount = _sourceSwap.mint(_mintAmounts, 0);
-    IERC20Upgradeable(_destSwap.poolToken()).safeApprove(
+    IERC20Upgradeable(address(_destSwap.poolToken())).safeApprove(
       address(_destSwap),
       mintAmount
     );
@@ -314,13 +366,23 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
   }
 
   /**
-   * @dev Updates the govenance address.
-   * @param _governance The new governance address.
+   * @dev Propose the govenance address.
+   * @param _governance Address of the new governance.
    */
-  function setGovernance(address _governance) external {
+  function proposeGovernance(address _governance) public {
     require(msg.sender == governance, "not governance");
-    governance = _governance;
-    emit GovernanceModified(_governance);
+    pendingGovernance = _governance;
+    emit GovernanceProposed(_governance);
+  }
+
+  /**
+   * @dev Accept the govenance address.
+   */
+  function acceptGovernance() public {
+    require(msg.sender == pendingGovernance, "not pending governance");
+    governance = pendingGovernance;
+    pendingGovernance = address(0);
+    emit GovernanceModified(governance);
   }
 
   /**
@@ -330,7 +392,34 @@ contract StableAssetApplication is Initializable, ReentrancyGuardUpgradeable {
    */
   function updatePool(address _swap, bool _enabled) external {
     require(msg.sender == governance, "not governance");
+    if (_enabled && !allowedPoolAddress[_swap]) {
+      pools.push(_swap);
+    } else {
+      address[] memory updatedPools;
+      uint256 index = 0;
+      for (uint256 i = 0; i < pools.length; i++) {
+        if (pools[i] != _swap) {
+          updatedPools[index] = pools[i];
+          index++;
+        }
+      }
+      pools = updatedPools;
+    }
     allowedPoolAddress[_swap] = _enabled;
+
     emit PoolModified(_swap, _enabled);
+  }
+
+  /**
+   * @notice This function allows to rebase TapETH by increasing his total supply
+   * from all stableSwap pools by the staking rewards and the swap fee.
+   */
+  function rebase() external returns (uint256 _amount) {
+    for (uint256 i = 0; i < pools.length; i++) {
+      address _pool = pools[i];
+      if (allowedPoolAddress[_pool]) {
+        _amount += Ipool(_pool).rebase();
+      }
+    }
   }
 }

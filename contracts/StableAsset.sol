@@ -1,13 +1,22 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.9;
+pragma solidity ^0.8.18;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 
 import "./misc/IERC20MintableBurnable.sol";
 import "./interfaces/IExchangeRateProvider.sol";
+import "./interfaces/ITapETH.sol";
+
+error InsufficientMintAmount(uint256 mintAmount, uint256 minMintAmount);
+error InsufficientSwapOutAmount(uint256 outAmount, uint256 minOutAmount);
+error InsufficientRedeemAmount(uint256 redeemAmount, uint256 minRedeemAmount);
+error MaxRedeemAmount(uint256 redeemAmount, uint256 maxRedeemAmount);
+error SameTokenInTokenOut(uint256 tokenInIndex, uint256 tokenOutIndex);
+error ImbalancedPool(uint256 oldD, uint256 newD);
 
 /**
  * @title StableAsset swap
@@ -21,18 +30,14 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
   /**
    * @notice This event is emitted when a token swap occurs.
    * @param buyer is the address of the account that made the swap.
-   * @param tokenSold is the address of the token that was sold.
-   * @param tokenBought is the address of the token that was bought.
-   * @param amountSold is the amount of `tokenSold` that was sold.
-   * @param amountBought is the amount of `tokenBought` that was bought.
+   * @param amounts is an array containing the amounts of each token received by the buyer.
    * @param feeAmount is the amount of transaction fee charged for the swap.
    */
   event TokenSwapped(
     address indexed buyer,
-    address indexed tokenSold,
-    address indexed tokenBought,
-    uint256 amountSold,
-    uint256 amountBought,
+    uint256 swapAmount,
+    uint256[] amounts,
+    bool[] amountPositive,
     uint256 feeAmount
   );
   /**
@@ -63,24 +68,17 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
   );
   /**
    * @dev This event is emitted when transaction fees are collected by the StableAsset contract.
-   * @param recipient is the address of the fee recipient.
    * @param feeAmount is the amount of fee collected.
    * @param totalSupply is the total supply of LP token.
    */
-  event FeeCollected(
-    address indexed recipient,
-    uint256 feeAmount,
-    uint256 totalSupply
-  );
+  event FeeCollected(uint256 feeAmount, uint256 totalSupply);
   /**
    * @dev This event is emitted when yield is collected by the StableAsset contract.
-   * @param recipient is the address of the yield recipient.
    * @param amounts is an array containing the amounts of each token the yield receives.
    * @param feeAmount is the amount of yield collected.
    * @param totalSupply is the total supply of LP token.
    */
   event YieldCollected(
-    address indexed recipient,
     uint256[] amounts,
     uint256 feeAmount,
     uint256 totalSupply
@@ -111,22 +109,16 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
   event RedeemFeeModified(uint256 redeemFee);
 
   /**
-   * @dev This event is emitted when the fee recipient is modified.
-   * @param recipient is the new value of the recipient.
+   * @dev This event is emitted when the governance is modified.
+   * @param governance is the new value of the governance.
    */
-  event FeeRecipientModified(address recipient);
-
-  /**
-   * @dev This event is emitted when the yield recipient is modified.
-   * @param recipient is the new value of the recipient.
-   */
-  event YieldRecipientModified(address recipient);
+  event GovernanceModified(address governance);
 
   /**
    * @dev This event is emitted when the governance is modified.
    * @param governance is the new value of the governance.
    */
-  event GovernanceModified(address governance);
+  event GovernanceProposed(address governance);
 
   /**
    * @dev This event is emitted when the fee margin is modified.
@@ -149,7 +141,7 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
   /**
    * @dev This is the denominator used for calculating transaction fees in the StableAsset contract.
    */
-  uint256 public constant FEE_DENOMINATOR = 10 ** 10;
+  uint256 private constant FEE_DENOMINATOR = 10 ** 10;
   /**
    *  @dev This is the maximum error margin for calculating transaction fees in the StableAsset contract.
    */
@@ -167,7 +159,11 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
   /**
    * @dev This is the maximum value of the amplification coefficient A.
    */
-  uint256 public constant MAX_A = 10 ** 6;
+  uint256 private constant MAX_A = 10 ** 6;
+  /**
+   *  @dev This is minimum initial mint
+   */
+  uint256 private constant INITIAL_MINT_MIN = 100000;
 
   /**
    * @dev This is an array of addresses representing the tokens currently supported by the StableAsset contract.
@@ -198,17 +194,9 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
    */
   uint256 public redeemFee;
   /**
-   * @dev This is the account which receives transaction fees collected by the StableAsset contract.
-   */
-  address public feeRecipient;
-  /**
-   * @dev This is the account which receives yield generated by the StableAsset contract.
-   */
-  address public yieldRecipient;
-  /**
    * @dev This is the address of the ERC20 token contract that represents the StableAsset pool token.
    */
-  address public poolToken;
+  ITapETH public poolToken;
   /**
    * @dev The total supply of pool token minted by the swap.
    * It might be different from the pool token supply as the pool token can have multiple minters.
@@ -268,12 +256,20 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
   uint256 public maxDeltaD;
 
   /**
+   * @dev Pending governance address.
+   */
+  address public pendingGovernance;
+
+  /**
+   * @dev Last redeem or mint timestamp
+   */
+  uint256 private lastRedeemOrMint;
+
+  /**
    * @dev Initializes the StableAsset contract with the given parameters.
    * @param _tokens The tokens in the pool.
    * @param _precisions The precisions of each token (10 ** (18 - token decimals)).
    * @param _fees The fees for minting, swapping, and redeeming.
-   * @param _feeRecipient The address that collects the fees.
-   * @param _yieldRecipient The address that receives yield farming rewards.
    * @param _poolToken The address of the pool token.
    * @param _A The initial value of the amplification coefficient A for the pool.
    */
@@ -281,9 +277,7 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     address[] memory _tokens,
     uint256[] memory _precisions,
     uint256[] memory _fees,
-    address _feeRecipient,
-    address _yieldRecipient,
-    address _poolToken,
+    ITapETH _poolToken,
     uint256 _A,
     IExchangeRateProvider _exchangeRateProvider,
     uint256 _exchangeRateTokenIndex
@@ -299,21 +293,19 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     for (uint256 i = 0; i < _tokens.length; i++) {
       require(_tokens[i] != address(0x0), "token not set");
       // query tokens decimals
-      (, bytes memory queriedDecimals) = _tokens[i].staticcall(
-        abi.encodeWithSignature("decimals()")
-      );
-      uint8 decimals = abi.decode(queriedDecimals, (uint8));
-
+      uint256 _decimals = ERC20Upgradeable(_tokens[i]).decimals();
       require(
-        _precisions[i] != 0 && _precisions[i] == 10 ** (18 - decimals),
+        _precisions[i] != 0 && _precisions[i] == 10 ** (18 - _decimals),
         "precision not set"
       );
-      require(_precisions[i] != 0, "precision not set");
       balances.push(0);
     }
-    require(_feeRecipient != address(0x0), "fee recipient not set");
-    require(_yieldRecipient != address(0x0), "yield recipient not set");
-    require(_poolToken != address(0x0), "pool token not set");
+    for (uint256 i = 0; i < _tokens.length; i++) {
+      for (uint256 j = i + 1; j < _tokens.length; j++) {
+        require(_tokens[i] != _tokens[j], "duplicate token address");
+      }
+    }
+    require(address(_poolToken) != address(0x0), "pool token not set");
     require(_A > 0 && _A < MAX_A, "A not set");
     require(
       address(_exchangeRateProvider) != address(0x0),
@@ -326,8 +318,6 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     __ReentrancyGuard_init();
 
     governance = msg.sender;
-    feeRecipient = _feeRecipient;
-    yieldRecipient = _yieldRecipient;
     tokens = _tokens;
     precisions = _precisions;
     mintFee = _fees[0];
@@ -344,6 +334,7 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     feeErrorMargin = DEFAULT_FEE_ERROR_MARGIN;
     yieldErrorMargin = DEFAULT_YIELD_ERROR_MARGIN;
     maxDeltaD = DEFAULT_MAX_DELTA_D;
+    lastRedeemOrMint = block.timestamp;
 
     // The swap must start with paused state!
     paused = true;
@@ -389,11 +380,18 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
      * We choose to implement n*n instead of n*(n-1) because it's
      * clearer in code and A value across pool is comparable.
      */
+    bool allZero = true;
     for (i = 0; i < _balances.length; i++) {
-      sum = sum + _balances[i];
+      uint256 correctedBalance = _balances[i];
+      if (correctedBalance != 0) {
+        allZero = false;
+      } else {
+        correctedBalance = 1;
+      }
+      sum = sum + correctedBalance;
       Ann = Ann * _balances.length;
     }
-    if (sum == 0) return 0;
+    if (allZero) return 0;
 
     uint256 prevD = 0;
     uint256 D = sum;
@@ -518,6 +516,7 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     // If swap is paused, only admins can mint.
     require(!paused || admins[msg.sender], "paused");
     require(balances.length == _amounts.length, "invalid amounts");
+    require(block.timestamp > lastRedeemOrMint, "same block redeem");
 
     collectFeeOrYield(false);
     uint256[] memory _balances = balances;
@@ -525,9 +524,11 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     uint256 oldD = totalSupply;
     uint256 i = 0;
     for (i = 0; i < _balances.length; i++) {
-      if (_amounts[i] == 0) {
+      if (_amounts[i] < INITIAL_MINT_MIN) {
         // Initial deposit requires all tokens provided!
         require(oldD > 0, "zero amount");
+      }
+      if (_amounts[i] == 0) {
         continue;
       }
       uint256 balanceAmount = _amounts[i];
@@ -547,7 +548,9 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
       feeAmount = (mintAmount * mintFee) / FEE_DENOMINATOR;
       mintAmount = mintAmount - feeAmount;
     }
-    require(mintAmount >= _minMintAmount, "fewer than expected");
+    if (mintAmount < _minMintAmount) {
+      revert InsufficientMintAmount(mintAmount, _minMintAmount);
+    }
 
     // Transfer tokens into the swap
     for (i = 0; i < _amounts.length; i++) {
@@ -560,11 +563,11 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
         _amounts[i]
       );
     }
-    totalSupply = newD;
-    IERC20MintableBurnable(poolToken).mint(feeRecipient, feeAmount);
-    IERC20MintableBurnable(poolToken).mint(msg.sender, mintAmount);
+    totalSupply = oldD + mintAmount;
+    poolToken.mintShares(msg.sender, mintAmount);
     feeAmount = collectFeeOrYield(true);
     emit Minted(msg.sender, mintAmount, _amounts, feeAmount);
+    lastRedeemOrMint = block.timestamp;
     return mintAmount;
   }
 
@@ -641,10 +644,12 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
   ) external nonReentrant returns (uint256) {
     // If swap is paused, only admins can swap.
     require(!paused || admins[msg.sender], "paused");
-    require(_i != _j, "same token");
+    if (_i == _j) {
+      revert SameTokenInTokenOut(_i, _j);
+    }
     require(_i < balances.length, "invalid in");
     require(_j < balances.length, "invalid out");
-    require(_dx > 0, "invalid amount");
+    require(_dx != 0, "invalid amount");
 
     collectFeeOrYield(false);
     uint256[] memory _balances = balances;
@@ -675,7 +680,10 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
         (_minDy * exchangeRateProvider.exchangeRate()) /
         (10 ** exchangeRateProvider.exchangeRateDecimals());
     }
-    require(dy >= _minDy, "fewer than expected");
+
+    if (dy < _minDy) {
+      revert InsufficientSwapOutAmount(dy, _minDy);
+    }
 
     IERC20Upgradeable(tokens[_i]).safeTransferFrom(
       msg.sender,
@@ -696,14 +704,20 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     }
     IERC20Upgradeable(tokens[_j]).safeTransfer(msg.sender, transferAmountJ);
 
-    feeAmount = collectFeeOrYield(true);
+    uint256[] memory amounts = new uint256[](_balances.length);
+    bool[] memory amountPositive = new bool[](_balances.length);
+    amounts[_i] = _dx;
+    amounts[_j] = transferAmountJ;
+    amountPositive[_i] = false;
+    amountPositive[_j] = true;
+
+    uint256 feeAmountActual = collectFeeOrYield(true);
     emit TokenSwapped(
       msg.sender,
-      tokens[_i],
-      tokens[_j],
-      _dx,
       transferAmountJ,
-      feeAmount
+      amounts,
+      amountPositive,
+      feeAmountActual
     );
     return transferAmountJ;
   }
@@ -720,13 +734,13 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     uint256[] memory _balances;
     uint256 _totalSupply;
     (_balances, _totalSupply) = getPendingYieldAmount();
-    require(_amount > 0, "zero amount");
+    require(_amount != 0, "zero amount");
 
     uint256 D = _totalSupply;
     uint256[] memory amounts = new uint256[](_balances.length);
-    uint256 feeAmount = 0;
+    uint256 feeAmount;
     uint256 redeemAmount = _amount;
-    if (redeemFee > 0) {
+    if (redeemFee != 0) {
       feeAmount = (_amount * redeemFee) / FEE_DENOMINATOR;
       redeemAmount = _amount - feeAmount;
     }
@@ -760,8 +774,9 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
   ) external nonReentrant returns (uint256[] memory) {
     // If swap is paused, only admins can redeem.
     require(!paused || admins[msg.sender], "paused");
-    require(_amount > 0, "zero amount");
+    require(_amount != 0, "zero amount");
     require(balances.length == _minRedeemAmounts.length, "invalid mins");
+    require(block.timestamp > lastRedeemOrMint, "same block redeem");
 
     collectFeeOrYield(false);
     uint256[] memory _balances = balances;
@@ -786,7 +801,9 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
           (minRedeemAmount * exchangeRateProvider.exchangeRate()) /
           (10 ** exchangeRateProvider.exchangeRateDecimals());
       }
-      require(amounts[i] >= minRedeemAmount, "fewer than expected");
+      if (amounts[i] < minRedeemAmount) {
+        revert InsufficientRedeemAmount(amounts[i], minRedeemAmount);
+      }
       // Updates the balance in storage
       balances[i] = _balances[i] - tokenAmount;
       uint256 transferAmount = amounts[i];
@@ -802,9 +819,9 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
 
     totalSupply = D - _amount;
     // After reducing the redeem fee, the remaining pool tokens are burned!
-    IERC20MintableBurnable(poolToken).burnFrom(msg.sender, _amount);
-
+    poolToken.burnSharesFrom(msg.sender, _amount);
     feeAmount = collectFeeOrYield(true);
+    lastRedeemOrMint = block.timestamp;
     emit Redeemed(msg.sender, _amount, amounts, feeAmount);
     return amounts;
   }
@@ -865,6 +882,7 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     require(!paused || admins[msg.sender], "paused");
     require(_amount > 0, "zero amount");
     require(_i < balances.length, "invalid token");
+    require(block.timestamp > lastRedeemOrMint, "same block redeem");
 
     collectFeeOrYield(false);
     uint256[] memory _balances = balances;
@@ -887,7 +905,9 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     // dy is not converted
     // dy = (balance[i] - y - 1) / precisions[i] in case there was rounding errors
     uint256 dy = (_balances[_i] - y - 1) / precisions[_i];
-    require(dy >= _minRedeemAmount, "fewer than expected");
+    if (dy < _minRedeemAmount) {
+      revert InsufficientRedeemAmount(dy, _minRedeemAmount);
+    }
     // Updates token balance in storage
     balances[_i] = y;
     uint256[] memory amounts = new uint256[](_balances.length);
@@ -899,10 +919,10 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     }
     amounts[_i] = transferAmount;
     IERC20Upgradeable(tokens[_i]).safeTransfer(msg.sender, transferAmount);
-
     totalSupply = D - _amount;
-    IERC20MintableBurnable(poolToken).burnFrom(msg.sender, _amount);
+    poolToken.burnSharesFrom(msg.sender, _amount);
     feeAmount = collectFeeOrYield(true);
+    lastRedeemOrMint = block.timestamp;
     emit Redeemed(msg.sender, _amount, amounts, feeAmount);
     return transferAmount;
   }
@@ -962,6 +982,7 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     require(_amounts.length == balances.length, "length not match");
     // If swap is paused, only admins can redeem.
     require(!paused || admins[msg.sender], "paused");
+    require(block.timestamp > lastRedeemOrMint, "same block redeem");
 
     collectFeeOrYield(false);
     uint256[] memory _balances = balances;
@@ -990,19 +1011,21 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
         (FEE_DENOMINATOR - redeemFee);
       feeAmount = redeemAmount - (oldD - newD);
     }
-    require(redeemAmount <= _maxRedeemAmount, "more than expected");
+    if (redeemAmount > _maxRedeemAmount) {
+      revert MaxRedeemAmount(redeemAmount, _maxRedeemAmount);
+    }
 
     // Updates token balances in storage.
     balances = _balances;
     totalSupply = oldD - redeemAmount;
-    IERC20MintableBurnable(poolToken).burnFrom(msg.sender, redeemAmount);
+    poolToken.burnSharesFrom(msg.sender, redeemAmount);
     uint256[] memory amounts = _amounts;
     for (i = 0; i < _balances.length; i++) {
       if (_amounts[i] == 0) continue;
       IERC20Upgradeable(tokens[i]).safeTransfer(msg.sender, _amounts[i]);
     }
-
     feeAmount = collectFeeOrYield(true);
+    lastRedeemOrMint = block.timestamp;
     emit Redeemed(msg.sender, redeemAmount, amounts, feeAmount);
     return amounts;
   }
@@ -1063,46 +1086,57 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
       if (oldD > newD && (oldD - newD) < feeErrorMargin) {
         return 0;
       } else if (oldD > newD) {
-        revert("pool imbalanced");
+        revert ImbalancedPool(oldD, newD);
       }
     } else {
       if (oldD > newD && (oldD - newD) < yieldErrorMargin) {
         return 0;
       } else if (oldD > newD) {
-        revert("pool imbalanced");
+        revert ImbalancedPool(oldD, newD);
       }
     }
     uint256 feeAmount = newD - oldD;
     if (feeAmount == 0) {
       return 0;
     }
+    poolToken.addTotalSupply(feeAmount);
 
     if (isFee) {
-      address recipient = feeRecipient;
-      IERC20MintableBurnable(poolToken).mint(recipient, feeAmount);
-      emit FeeCollected(recipient, feeAmount, totalSupply);
+      emit FeeCollected(feeAmount, totalSupply);
     } else {
-      address recipient = yieldRecipient;
-      IERC20MintableBurnable(poolToken).mint(recipient, feeAmount);
-
       uint256[] memory amounts = new uint256[](_balances.length);
       for (uint256 i = 0; i < _balances.length; i++) {
-        amounts[i] = _balances[i] - oldBalances[i];
+        uint256 amount = _balances[i] - oldBalances[i];
+        if (i == exchangeRateTokenIndex) {
+          amount =
+            (amount * (10 ** exchangeRateProvider.exchangeRateDecimals())) /
+            exchangeRateProvider.exchangeRate();
+        }
+        amounts[i] = amount / precisions[i];
       }
-
-      emit YieldCollected(recipient, amounts, feeAmount, totalSupply);
+      emit YieldCollected(amounts, feeAmount, totalSupply);
     }
     return feeAmount;
   }
 
   /**
-   * @dev Updates the govenance address.
-   * @param _governance The new governance address.
+   * @dev Propose the govenance address.
+   * @param _governance Address of the new governance.
    */
-  function setGovernance(address _governance) external {
+  function proposeGovernance(address _governance) public {
     require(msg.sender == governance, "not governance");
-    governance = _governance;
-    emit GovernanceModified(_governance);
+    pendingGovernance = _governance;
+    emit GovernanceProposed(_governance);
+  }
+
+  /**
+   * @dev Accept the govenance address.
+   */
+  function acceptGovernance() public {
+    require(msg.sender == pendingGovernance, "not pending governance");
+    governance = pendingGovernance;
+    pendingGovernance = address(0);
+    emit GovernanceModified(governance);
   }
 
   /**
@@ -1136,28 +1170,6 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     require(_redeemFee < FEE_DENOMINATOR, "exceed limit");
     redeemFee = _redeemFee;
     emit RedeemFeeModified(_redeemFee);
-  }
-
-  /**
-   * @dev Updates the recipient of mint/swap/redeem fees.
-   * @param _feeRecipient The new recipient of mint/swap/redeem fees.
-   */
-  function setFeeRecipient(address _feeRecipient) external {
-    require(msg.sender == governance, "not governance");
-    require(_feeRecipient != address(0x0), "fee recipient not set");
-    feeRecipient = _feeRecipient;
-    emit FeeRecipientModified(_feeRecipient);
-  }
-
-  /**
-   * @dev Updates the recipient of yield.
-   * @param _yieldRecipient The new recipient of yield.
-   */
-  function setYieldRecipient(address _yieldRecipient) external {
-    require(msg.sender == governance, "not governance");
-    require(_yieldRecipient != address(0x0), "fee recipient not set");
-    yieldRecipient = _yieldRecipient;
-    emit YieldRecipientModified(_yieldRecipient);
   }
 
   /**
@@ -1207,6 +1219,7 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
     futureA = _futureA;
     futureABlock = _futureABlock;
 
+    collectFeeOrYield(false);
     uint256 newD = _getD(balances, futureA);
     uint256 absolute = totalSupply > newD
       ? totalSupply - newD
@@ -1244,9 +1257,68 @@ contract StableAsset is Initializable, ReentrancyGuardUpgradeable {
   }
 
   /**
+   * @dev Distribute losses
+   */
+  function distributeLoss() external {
+    require(msg.sender == governance, "not governance");
+    require(paused, "not paused");
+
+    uint256[] memory _balances = balances;
+    uint256 A = getA();
+    uint256 oldD = totalSupply;
+
+    for (uint256 i = 0; i < _balances.length; i++) {
+      uint256 balanceI = IERC20Upgradeable(tokens[i]).balanceOf(address(this));
+      if (i == exchangeRateTokenIndex) {
+        balanceI =
+          (balanceI * (exchangeRateProvider.exchangeRate())) /
+          (10 ** exchangeRateProvider.exchangeRateDecimals());
+      }
+      _balances[i] = balanceI * precisions[i];
+    }
+    uint256 newD = _getD(_balances, A);
+
+    require(newD < oldD, "no losses");
+    poolToken.removeTotalSupply(oldD - newD);
+    balances = _balances;
+    totalSupply = newD;
+  }
+
+  /**
    * @dev Returns the array of token addresses in the pool.
    */
   function getTokens() public view returns (address[] memory) {
     return tokens;
+  }
+
+  /**
+   * @notice This function allows to rebase TapETH by increasing his total supply
+   * from the current stableSwap pool by the staking rewards and the swap fee.
+   */
+  function rebase() external returns (uint256) {
+    uint256[] memory _balances = balances;
+    uint256 A = getA();
+    uint256 oldD = totalSupply;
+
+    for (uint256 i = 0; i < _balances.length; i++) {
+      uint256 balanceI = IERC20Upgradeable(tokens[i]).balanceOf(address(this));
+      if (i == exchangeRateTokenIndex) {
+        balanceI =
+          (balanceI * (exchangeRateProvider.exchangeRate())) /
+          (10 ** exchangeRateProvider.exchangeRateDecimals());
+      }
+      _balances[i] = balanceI * precisions[i];
+    }
+    uint256 newD = _getD(_balances, A);
+
+    if (oldD > newD) {
+      return 0;
+    } else {
+      balances = _balances;
+      totalSupply = newD;
+      uint256 _amount = newD - oldD;
+      poolToken.addTotalSupply(_amount);
+      return _amount;
+    }
   }
 }
